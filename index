@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Videochamada WebRTC</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Variáveis globais fornecidas pelo ambiente
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app;
+        let db;
+        let auth;
+        let userId;
+
+        const servers = {
+            iceServers: [{
+                urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302']
+            }]
+        };
+
+        let peerConnection;
+        let localStream;
+        let remoteStream;
+
+        let callId;
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            if (!firebaseConfig) {
+                console.error('Configuração do Firebase não encontrada. O aplicativo pode não funcionar corretamente.');
+                return;
+            }
+
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                await signInWithCustomToken(auth, initialAuthToken).catch(async (error) => {
+                    console.error("Erro ao fazer login com token personalizado, tentando login anônimo.", error);
+                    await signInAnonymously(auth);
+                });
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        console.log("Usuário autenticado:", userId);
+                        setupUI();
+                    } else {
+                        console.log("Nenhum usuário logado.");
+                    }
+                });
+
+            } catch (error) {
+                console.error("Erro na inicialização do Firebase:", error);
+                document.getElementById('status-message').textContent = 'Erro ao inicializar o aplicativo. Por favor, tente novamente mais tarde.';
+            }
+        });
+
+        async function setupUI() {
+            const createButton = document.getElementById('create-button');
+            const joinButton = document.getElementById('join-button');
+            const hangupButton = document.getElementById('hangup-button');
+            const copyButton = document.getElementById('copy-button');
+            const statusMessage = document.getElementById('status-message');
+            const callIdInput = document.getElementById('call-id-input');
+            const localVideo = document.getElementById('local-video');
+            const remoteVideo = document.getElementById('remote-video');
+
+            createButton.addEventListener('click', createCall);
+            joinButton.addEventListener('click', joinCall);
+            hangupButton.addEventListener('click', hangupCall);
+            copyButton.addEventListener('click', copyRoomId);
+
+            // Iniciar a câmera e o microfone
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                localVideo.srcObject = localStream;
+            } catch (error) {
+                // Esse erro geralmente ocorre porque o navegador não encontrou uma câmera ou microfone,
+                // ou o usuário negou as permissões. Não é um bug no código.
+                console.error('Erro ao acessar a câmera/microfone. Por favor, verifique se você deu permissão e se o dispositivo está conectado.', error);
+                statusMessage.textContent = 'Erro ao acessar a câmera e o microfone. Certifique-se de que as permissões foram concedidas.';
+                return;
+            }
+
+            // UI state
+            function setUIState(state) {
+                switch (state) {
+                    case 'initial':
+                        createButton.disabled = false;
+                        joinButton.disabled = false;
+                        hangupButton.disabled = true;
+                        callIdInput.disabled = false;
+                        copyButton.disabled = true;
+                        statusMessage.textContent = 'Crie uma sala ou entre em uma.';
+                        break;
+                    case 'creating':
+                        createButton.disabled = true;
+                        joinButton.disabled = true;
+                        hangupButton.disabled = true;
+                        callIdInput.disabled = true;
+                        copyButton.disabled = true;
+                        statusMessage.textContent = 'Criando sala...';
+                        break;
+                    case 'joining':
+                        createButton.disabled = true;
+                        joinButton.disabled = true;
+                        hangupButton.disabled = true;
+                        callIdInput.disabled = true;
+                        copyButton.disabled = true;
+                        statusMessage.textContent = 'Entrando na sala...';
+                        break;
+                    case 'in-call':
+                        createButton.disabled = true;
+                        joinButton.disabled = true;
+                        hangupButton.disabled = false;
+                        callIdInput.disabled = true;
+                        copyButton.disabled = false;
+                        statusMessage.textContent = `Em chamada. ID da Sala: ${callIdInput.value}`;
+                        break;
+                    case 'hangup':
+                        createButton.disabled = false;
+                        joinButton.disabled = false;
+                        hangupButton.disabled = true;
+                        callIdInput.disabled = false;
+                        copyButton.disabled = true;
+                        statusMessage.textContent = 'Chamada encerrada.';
+                        break;
+                }
+            }
+
+            async function createCall() {
+                setUIState('creating');
+
+                // Referência para o documento do Firestore
+                const callDoc = doc(collection(db, `artifacts/${appId}/public/calls`));
+                callId = callDoc.id;
+                callIdInput.value = callId;
+                statusMessage.textContent = `Sala criada. ID: ${callId}. Compartilhe com a outra pessoa. Aguardando...`;
+
+                // Coletar candidatos ICE para o criador da chamada
+                const offerCandidates = collection(callDoc, 'offerCandidates');
+                const answerCandidates = collection(callDoc, 'answerCandidates');
+
+                peerConnection = new RTCPeerConnection(servers);
+                localStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, localStream);
+                });
+
+                peerConnection.ontrack = (event) => {
+                    console.log('Got remote track:', event.streams[0]);
+                    remoteVideo.srcObject = event.streams[0];
+                };
+
+                peerConnection.onicecandidate = async (event) => {
+                    if (event.candidate) {
+                        await addDoc(offerCandidates, event.candidate.toJSON());
+                    }
+                };
+
+                // Criar a oferta
+                const offerDescription = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offerDescription);
+
+                const offer = {
+                    sdp: offerDescription.sdp,
+                    type: offerDescription.type,
+                };
+                await setDoc(callDoc, { offer });
+
+                // Esperar a resposta do outro lado
+                onSnapshot(callDoc, async (snapshot) => {
+                    const data = snapshot.data();
+                    if (!peerConnection.currentRemoteDescription && data?.answer) {
+                        console.log('Got remote answer:', data.answer);
+                        const answerDescription = new RTCSessionDescription(data.answer);
+                        await peerConnection.setRemoteDescription(answerDescription);
+                        setUIState('in-call');
+                    }
+                });
+
+                // Escutar os candidatos ICE do outro lado
+                onSnapshot(answerCandidates, (snapshot) => {
+                    snapshot.docChanges().forEach((change) => {
+                        if (change.type === 'added') {
+                            const candidate = new RTCIceCandidate(change.doc.data());
+                            peerConnection.addIceCandidate(candidate);
+                        }
+                    });
+                });
+            }
+
+            async function joinCall() {
+                setUIState('joining');
+                callId = callIdInput.value;
+                if (!callId) {
+                    statusMessage.textContent = 'Por favor, insira um ID de sala válido.';
+                    setUIState('initial');
+                    return;
+                }
+
+                const callDoc = doc(db, `artifacts/${appId}/public/calls/${callId}`);
+                const offerCandidates = collection(callDoc, 'offerCandidates');
+                const answerCandidates = collection(callDoc, 'answerCandidates');
+
+                peerConnection = new RTCPeerConnection(servers);
+                localStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, localStream);
+                });
+
+                peerConnection.ontrack = (event) => {
+                    console.log('Got remote track:', event.streams[0]);
+                    remoteVideo.srcObject = event.streams[0];
+                };
+
+                peerConnection.onicecandidate = async (event) => {
+                    if (event.candidate) {
+                        await addDoc(answerCandidates, event.candidate.toJSON());
+                    }
+                };
+
+                const callData = await getDoc(callDoc);
+                const offer = callData.data()?.offer;
+
+                if (!offer) {
+                    statusMessage.textContent = 'ID de sala inválido ou sala não encontrada.';
+                    setUIState('initial');
+                    return;
+                }
+
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+                const answerDescription = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answerDescription);
+
+                const answer = {
+                    sdp: answerDescription.sdp,
+                    type: answerDescription.type,
+                };
+                await updateDoc(callDoc, { answer });
+                setUIState('in-call');
+
+                // Escutar os candidatos ICE do outro lado
+                onSnapshot(offerCandidates, (snapshot) => {
+                    snapshot.docChanges().forEach((change) => {
+                        if (change.type === 'added') {
+                            const candidate = new RTCIceCandidate(change.doc.data());
+                            peerConnection.addIceCandidate(candidate);
+                        }
+                    });
+                });
+            }
+
+            function hangupCall() {
+                if (peerConnection) {
+                    peerConnection.close();
+                    peerConnection = null;
+                }
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                }
+                localVideo.srcObject = null;
+                remoteVideo.srcObject = null;
+                setUIState('hangup');
+            }
+
+            function copyRoomId() {
+                const callIdValue = document.getElementById('call-id-input').value;
+                if (callIdValue) {
+                    const textarea = document.createElement('textarea');
+                    textarea.value = callIdValue;
+                    document.body.appendChild(textarea);
+                    textarea.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(textarea);
+                    statusMessage.textContent = 'ID da sala copiado!';
+                }
+            }
+
+            setUIState('initial');
+        }
+    </script>
+</head>
+
+<body class="bg-gray-900 text-white font-sans flex items-center justify-center min-h-screen p-4">
+    <div class="bg-gray-800 rounded-2xl shadow-lg p-6 w-full max-w-4xl mx-auto flex flex-col md:flex-row gap-6">
+        <!-- Vídeos -->
+        <div class="flex-1 flex flex-col gap-4">
+            <div class="relative w-full h-auto bg-gray-700 rounded-xl overflow-hidden shadow-md aspect-video">
+                <video id="local-video" autoplay muted class="w-full h-full object-cover"></video>
+                <p class="absolute bottom-2 left-2 bg-gray-900 bg-opacity-50 text-white text-xs px-2 py-1 rounded-full">Sua Câmera</p>
+            </div>
+            <div class="relative w-full h-auto bg-gray-700 rounded-xl overflow-hidden shadow-md aspect-video">
+                <video id="remote-video" autoplay class="w-full h-full object-cover"></video>
+                <p class="absolute bottom-2 left-2 bg-gray-900 bg-opacity-50 text-white text-xs px-2 py-1 rounded-full">Câmera do Amigo</p>
+            </div>
+        </div>
+
+        <!-- Controles -->
+        <div class="flex-shrink-0 w-full md:w-80 flex flex-col gap-4 bg-gray-700 p-5 rounded-2xl shadow-md">
+            <h1 class="text-2xl font-bold text-center mb-4 text-blue-400">Videochamada</h1>
+            <p id="status-message" class="text-center text-sm text-gray-300 transition-all duration-300">Inicializando...</p>
+
+            <div class="flex flex-col gap-2">
+                <button id="create-button"
+                    class="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition-colors duration-200 disabled:bg-gray-500 disabled:cursor-not-allowed">
+                    Criar Nova Sala
+                </button>
+
+                <div class="relative">
+                    <input type="text" id="call-id-input" placeholder="ID da Sala"
+                        class="w-full py-3 px-4 pl-12 bg-gray-800 text-gray-200 placeholder-gray-400 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all duration-200 disabled:bg-gray-600 disabled:text-gray-400">
+                    <button id="copy-button"
+                        class="absolute right-3 top-1/2 -translate-y-1/2 p-2 bg-gray-600 hover:bg-gray-500 rounded-full transition-colors duration-200 disabled:bg-gray-700 disabled:cursor-not-allowed">
+                        <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                            xmlns="http://www.w3.org/2000/svg">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z">
+                            </path>
+                        </svg>
+                    </button>
+                    <svg class="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" fill="none"
+                        stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14">
+                        </path>
+                    </svg>
+                </div>
+                <button id="join-button"
+                    class="w-full py-3 px-4 bg-green-600 hover:bg-green-700 text-white font-medium rounded-lg transition-colors duration-200 disabled:bg-gray-500 disabled:cursor-not-allowed">
+                    Entrar na Sala
+                </button>
+            </div>
+
+            <button id="hangup-button"
+                class="w-full py-3 px-4 bg-red-600 hover:bg-red-700 text-white font-medium rounded-lg transition-colors duration-200 disabled:bg-gray-500 disabled:cursor-not-allowed">
+                Encerrar Chamada
+            </button>
+        </div>
+    </div>
+</body>
+
+</html>
