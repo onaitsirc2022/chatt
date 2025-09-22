@@ -31,6 +31,8 @@
         let peerConnection;
         let localStream;
         let remoteStream;
+        let mediaRecorder;
+        const recordedChunks = [];
 
         let callId;
 
@@ -71,6 +73,8 @@
             const joinButton = document.getElementById('join-button');
             const hangupButton = document.getElementById('hangup-button');
             const copyButton = document.getElementById('copy-button');
+            const recordButton = document.getElementById('record-button');
+            const stopButton = document.getElementById('stop-button');
             const statusMessage = document.getElementById('status-message');
             const callIdInput = document.getElementById('call-id-input');
             const localVideo = document.getElementById('local-video');
@@ -80,6 +84,8 @@
             joinButton.addEventListener('click', joinCall);
             hangupButton.addEventListener('click', hangupCall);
             copyButton.addEventListener('click', copyRoomId);
+            recordButton.addEventListener('click', startRecording);
+            stopButton.addEventListener('click', stopRecording);
 
             // Iniciar a câmera e o microfone
             try {
@@ -102,6 +108,8 @@
                         hangupButton.disabled = true;
                         callIdInput.disabled = false;
                         copyButton.disabled = true;
+                        recordButton.style.display = 'none';
+                        stopButton.style.display = 'none';
                         statusMessage.textContent = 'Crie uma sala ou entre em uma.';
                         break;
                     case 'creating':
@@ -110,6 +118,8 @@
                         hangupButton.disabled = true;
                         callIdInput.disabled = true;
                         copyButton.disabled = true;
+                        recordButton.style.display = 'none';
+                        stopButton.style.display = 'none';
                         statusMessage.textContent = 'Criando sala...';
                         break;
                     case 'joining':
@@ -118,6 +128,8 @@
                         hangupButton.disabled = true;
                         callIdInput.disabled = true;
                         copyButton.disabled = true;
+                        recordButton.style.display = 'none';
+                        stopButton.style.display = 'none';
                         statusMessage.textContent = 'Entrando na sala...';
                         break;
                     case 'in-call':
@@ -126,7 +138,14 @@
                         hangupButton.disabled = false;
                         callIdInput.disabled = true;
                         copyButton.disabled = false;
+                        recordButton.style.display = 'block';
+                        stopButton.style.display = 'none';
                         statusMessage.textContent = `Em chamada. ID da Sala: ${callIdInput.value}`;
+                        break;
+                    case 'recording':
+                        recordButton.style.display = 'none';
+                        stopButton.style.display = 'block';
+                        statusMessage.textContent = `Gravando...`;
                         break;
                     case 'hangup':
                         createButton.disabled = false;
@@ -134,6 +153,8 @@
                         hangupButton.disabled = true;
                         callIdInput.disabled = false;
                         copyButton.disabled = true;
+                        recordButton.style.display = 'none';
+                        stopButton.style.display = 'none';
                         statusMessage.textContent = 'Chamada encerrada.';
                         break;
                 }
@@ -160,6 +181,7 @@
                 peerConnection.ontrack = (event) => {
                     console.log('Got remote track:', event.streams[0]);
                     remoteVideo.srcObject = event.streams[0];
+                    remoteStream = event.streams[0];
                 };
 
                 peerConnection.onicecandidate = async (event) => {
@@ -221,6 +243,7 @@
                 peerConnection.ontrack = (event) => {
                     console.log('Got remote track:', event.streams[0]);
                     remoteVideo.srcObject = event.streams[0];
+                    remoteStream = event.streams[0];
                 };
 
                 peerConnection.onicecandidate = async (event) => {
@@ -286,6 +309,45 @@
                 }
             }
 
+            async function startRecording() {
+                if (!remoteStream) {
+                    statusMessage.textContent = 'Não há vídeo remoto para gravar.';
+                    return;
+                }
+                recordedChunks.length = 0;
+                mediaRecorder = new MediaRecorder(remoteStream);
+
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        recordedChunks.push(event.data);
+                    }
+                };
+
+                mediaRecorder.onstop = () => {
+                    const blob = new Blob(recordedChunks, { type: 'video/webm' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    document.body.appendChild(a);
+                    a.style.display = 'none';
+                    a.href = url;
+                    a.download = `videochamada-${Date.now()}.webm`;
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    statusMessage.textContent = 'Gravação baixada!';
+                    setUIState('in-call'); // Voltar ao estado de chamada
+                };
+
+                mediaRecorder.start();
+                setUIState('recording');
+            }
+
+            function stopRecording() {
+                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                    mediaRecorder.stop();
+                    statusMessage.textContent = 'Encerrando gravação...';
+                }
+            }
+
             setUIState('initial');
         }
     </script>
@@ -345,6 +407,20 @@
                 class="w-full py-3 px-4 bg-red-600 hover:bg-red-700 text-white font-medium rounded-lg transition-colors duration-200 disabled:bg-gray-500 disabled:cursor-not-allowed">
                 Encerrar Chamada
             </button>
+            
+            <!-- Controles de Gravação -->
+            <div class="mt-6 flex flex-col gap-2">
+                <button id="record-button"
+                    class="w-full py-3 px-4 bg-purple-600 hover:bg-purple-700 text-white font-medium rounded-lg transition-colors duration-200"
+                    style="display: none;">
+                    Gravar
+                </button>
+                <button id="stop-button"
+                    class="w-full py-3 px-4 bg-orange-600 hover:bg-orange-700 text-white font-medium rounded-lg transition-colors duration-200"
+                    style="display: none;">
+                    Parar e Baixar Gravação
+                </button>
+            </div>
         </div>
     </div>
 </body>
